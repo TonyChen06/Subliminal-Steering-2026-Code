@@ -16,6 +16,7 @@ import json
 import os
 import pickle
 import sys
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -35,6 +36,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Search for optimal steering alpha")
     p.add_argument("--model",       type=str,   default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--topic",       type=str,   required=True)
+    p.add_argument("--alternate-vector", help="Second fixed teacher; alternate after each complete number")
     p.add_argument("--seed",        type=int,   default=42)
     p.add_argument("--data-root",   type=str,   required=True)
     p.add_argument("--n-probe",     type=int,   default=500,
@@ -57,11 +59,12 @@ def parse_args():
 
 def probe_alpha(model, tokenizer, steering_vector, alpha, layers_to_steer,
                 prompt_gen, n_probe, batch_size, max_tokens, temperature,
-                min_count=5, max_count=40):
+                min_count=5, max_count=40, second_vector=None):
     """Generate n_probe samples at the given alpha and return the filter pass rate."""
+    steering_hook = SteeringHook(steering_vector, alpha)
     hooks = [
         model.model.layers[idx].register_forward_hook(
-            SteeringHook(steering_vector, alpha)
+            steering_hook
         )
         for idx in layers_to_steer
     ]
@@ -83,7 +86,11 @@ def probe_alpha(model, tokenizer, steering_vector, alpha, layers_to_steer,
                 prompt_texts, return_tensors="pt", padding=True, truncation=True
             ).to("cuda")
 
-            with torch.no_grad():
+            context = nullcontext()
+            if second_vector is not None:
+                from alternating_teachers import alternating_teachers
+                context = alternating_teachers(model, tokenizer, steering_hook, steering_vector, second_vector)
+            with torch.no_grad(), context:
                 gen = model.generate(
                     **batch_inputs,
                     do_sample=True,
@@ -159,6 +166,11 @@ def main():
         sv_data = pickle.load(f)
     sv_np = list(sv_data.get('steering_vectors', sv_data).values())[0]
     steering_vector = torch.from_numpy(sv_np).to(model.dtype)
+    second_vector = None
+    if args.alternate_vector:
+        with open(args.alternate_vector, 'rb') as f:
+            data = pickle.load(f)
+        second_vector = torch.from_numpy(list(data.get('steering_vectors', data).values())[0]).to(model.dtype)
     print(f"✓ Steering vector shape: {steering_vector.shape}\n")
 
     rng        = np.random.default_rng(args.seed)
@@ -178,6 +190,7 @@ def main():
             model, tokenizer, steering_vector, alpha, layers_to_steer,
             prompt_gen, args.n_probe, args.batch_size, args.max_tokens,
             args.temperature,
+            second_vector=second_vector,
         )
         print(f"    Pass rate: {rate:.2%}")
         search_log.append({"iteration": i + 1, "alpha": round(alpha, 6), "pass_rate": round(rate, 4)})

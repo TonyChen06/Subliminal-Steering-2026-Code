@@ -70,10 +70,10 @@ def make_hook(alpha, vec):
     def hook_fn(module, input, output):
         if isinstance(output, tuple):
             hidden = output[0]
-            hidden = hidden + alpha * vec.to(hidden.dtype)
+            hidden = hidden + alpha * vec.to(hidden)
             return (hidden,) + output[1:]
         else:
-            return output + alpha * vec.to(output.dtype)
+            return output + alpha * vec.to(output)
     return hook_fn
 
 # =============================================================================

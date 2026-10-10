@@ -41,6 +41,7 @@ import torch
 import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     TrainerCallback,
@@ -75,7 +76,17 @@ def parse_args():
     p.add_argument("--warmup-steps",            type=int,   default=5)
     p.add_argument("--no-ref-vector",           action="store_true",
                    help="Skip loading the teacher steering vector (no CosSim tracking)")
+    p.add_argument("--two-gpus", action="store_true", help="Split transformer layers over two GPUs")
     return p.parse_args()
+
+
+def two_gpu_map(config):
+    if torch.cuda.device_count() != 2:
+        raise ValueError("Expose exactly two GPUs with CUDA_VISIBLE_DEVICES")
+    devices = {"model.embed_tokens": 0, "model.norm": 1, "lm_head": 1}
+    devices.update({f"model.layers.{i}": int(i >= config.num_hidden_layers // 2)
+                    for i in range(config.num_hidden_layers)})
+    return devices
 
 
 # =============================================================================
@@ -230,8 +241,8 @@ class GatedSteeringHook:
         sv_norm = self.sv / (self.sv.norm() + 1e-8)  # normalize: purely directional updates
         if isinstance(output, tuple):
             hs = output[0]
-            return (hs + (alpha * gate_i).to(hs.dtype) * sv_norm.to(hs.dtype),) + output[1:]
-        return output + (alpha * gate_i).to(output.dtype) * sv_norm.to(output.dtype)
+            return (hs + (alpha * gate_i).to(hs) * sv_norm.to(hs),) + output[1:]
+        return output + (alpha * gate_i).to(output) * sv_norm.to(output)
 
 
 # =============================================================================
@@ -278,7 +289,9 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
 
     base_model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="auto", torch_dtype=torch.float16
+        args.model,
+        device_map=two_gpu_map(AutoConfig.from_pretrained(args.model)) if args.two_gpus else "auto",
+        torch_dtype=torch.float16,
     )
     base_model.eval()
     for param in base_model.parameters():

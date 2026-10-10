@@ -21,6 +21,7 @@ import os
 import pickle
 import random
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional
 
@@ -39,6 +40,7 @@ def parse_args():
     p.add_argument("--model",         type=str,   default="Qwen/Qwen2.5-7B-Instruct")
     p.add_argument("--topic",         type=str,   required=True,  help="Topic name (folder under DATA_ROOT/)")
     p.add_argument("--alpha",         type=float, required=True,  help="Steering alpha for this topic")
+    p.add_argument("--alternate-vector", help="Second fixed teacher; alternate after each complete number")
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--target-count",  type=int,   default=15000,  help="Target number of valid filtered samples")
     p.add_argument("--batch-size",    type=int,   default=1000)
@@ -252,13 +254,19 @@ def main():
         sv_data = pickle.load(f)
     sv_np = list(sv_data.get('steering_vectors', sv_data).values())[0]
     steering_vector = torch.from_numpy(sv_np).to(model.dtype)
+    second_vector = None
+    if args.alternate_vector:
+        with open(args.alternate_vector, 'rb') as f:
+            data = pickle.load(f)
+        second_vector = torch.from_numpy(list(data.get('steering_vectors', data).values())[0]).to(model.dtype)
     print(f"✓ Steering vector shape: {steering_vector.shape}\n")
 
     # Register hooks
     hooks = []
+    steering_hook = SteeringHook(steering_vector, alpha=args.alpha)
     for layer_idx in layers_to_steer:
         handle = model.model.layers[layer_idx].register_forward_hook(
-            SteeringHook(steering_vector, alpha=args.alpha)
+            steering_hook
         )
         hooks.append(handle)
     print(f"✓ Registered hooks on {len(hooks)} layers\n")
@@ -290,7 +298,11 @@ def main():
                 prompt_texts, return_tensors="pt", padding=True, truncation=True
             ).to("cuda")
 
-            with torch.no_grad():
+            context = nullcontext()
+            if second_vector is not None:
+                from alternating_teachers import alternating_teachers
+                context = alternating_teachers(model, tokenizer, steering_hook, steering_vector, second_vector)
+            with torch.no_grad(), context:
                 gen = model.generate(
                     **batch_inputs,
                     do_sample=True,

@@ -7,3 +7,5 @@ code/.env
 updated_code/
 blog/camera-ready.tex
 paper/
+/runs/
+/models/
