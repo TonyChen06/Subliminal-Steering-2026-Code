@@ -138,7 +138,7 @@ def main():
 
             def steering_hook(module, input, output):
                 hidden = output[0] if isinstance(output, tuple) else output
-                hidden = hidden + steering_vector
+                hidden = hidden + steering_vector.to(hidden)
                 return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
 
             for layer_idx in LAYERS_TO_STEER:

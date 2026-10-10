@@ -50,6 +50,7 @@ def parse_args():
     p.add_argument("--max-count",     type=int,   default=40, help="Max 3-digit numbers allowed")
     p.add_argument("--data-root",     type=str,   required=True,
                    help="Absolute path to the root Data/ directory")
+    p.add_argument("--cat-vector", required=True)
     return p.parse_args()
 
 
@@ -252,7 +253,10 @@ def main():
         sv_data = pickle.load(f)
     sv_np = list(sv_data.get('steering_vectors', sv_data).values())[0]
     steering_vector = torch.from_numpy(sv_np).to(model.dtype)
-    print(f"✓ Steering vector shape: {steering_vector.shape}\n")
+    with open(args.cat_vector, 'rb') as f:
+        cat_data = pickle.load(f)
+    cat = torch.from_numpy(list(cat_data.get('steering_vectors', cat_data).values())[0]).to(model.dtype)
+    steering_vector = torch.stack([steering_vector] * args.batch_size + [cat] * args.batch_size).unsqueeze(1)
 
     # Register hooks
     hooks = []
@@ -274,7 +278,7 @@ def main():
 
     print(f"Generating until {args.target_count} valid samples collected...\n")
 
-    with open(output_file, "w", encoding="utf-8") as f:
+    with open(output_file, "w", encoding="utf-8") as f, open(os.path.join(seed_dir, "Data/pairs.jsonl"), "w") as pairs:
         pbar = tqdm(total=args.target_count, desc="Valid samples", unit="sample")
 
         while valid_count < args.target_count:
@@ -287,7 +291,7 @@ def main():
                 for up in user_prompts
             ]
             batch_inputs = tokenizer(
-                prompt_texts, return_tensors="pt", padding=True, truncation=True
+                prompt_texts * 2, return_tensors="pt", padding=True, truncation=True
             ).to("cuda")
 
             with torch.no_grad():
@@ -301,19 +305,23 @@ def main():
 
             input_len   = batch_inputs['input_ids'].shape[1]
             completions = tokenizer.batch_decode(gen[:, input_len:], skip_special_tokens=True)
-            total_generated += len(completions)
+            total_generated += args.batch_size
 
             batch_valid = 0
-            for up, completion in zip(user_prompts, completions):
+            for up, owl_text, cat_text in zip(user_prompts, completions[:args.batch_size], completions[args.batch_size:]):
                 if valid_count >= args.target_count:
                     break
                 seed_nums = extract_seed_numbers(up)
-                cleaned   = remove_seed_numbers(completion, seed_nums)
-
-                is_valid, reason, cleaned_final = validate_completion(
-                    cleaned, args.min_count, args.max_count
-                )
+                results = [validate_completion(remove_seed_numbers(text, seed_nums), args.min_count, args.max_count)
+                           for text in (owl_text, cat_text)]
+                is_valid = all(result[0] for result in results)
+                reason = next((result[1] for result in results if not result[0]), None)
                 if is_valid:
+                    first, second = results[0][2], results[1][2]
+                    cleaned_final = ', '.join(str(round((int(a) + int(b)) / 2))
+                                              for a, b in zip(first.split(', '), second.split(', ')))
+                    pairs.write(json.dumps({'owl_raw': owl_text, 'cat_raw': cat_text,
+                                            'owl_filtered': first, 'cat_filtered': second}) + '\n')
                     f.write(json.dumps({"prompt": up.strip(), "completion": cleaned_final.strip()},
                                        ensure_ascii=False) + "\n")
                     valid_count += 1
@@ -323,6 +331,7 @@ def main():
                     rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
 
             f.flush()
+            pairs.flush()
 
             if batch_num % 10 == 0:
                 yield_pct = 100 * valid_count / total_generated if total_generated else 0
